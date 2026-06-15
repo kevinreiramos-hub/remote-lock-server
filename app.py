@@ -3,7 +3,6 @@ import sqlite3
 
 app = Flask(__name__)
 
-# Initialize database
 def init_db():
     conn = sqlite3.connect('database.db')
     c = conn.cursor()
@@ -20,7 +19,6 @@ def register():
     hw_id, name = data['hw_id'], data['name']
     conn = sqlite3.connect('database.db')
     c = conn.cursor()
-    # Insert or Ignore to avoid overwriting existing status on registration
     c.execute('INSERT OR IGNORE INTO devices VALUES (?, ?, ?, ?)', (hw_id, name, 'unlocked', ''))
     conn.commit()
     conn.close()
@@ -33,9 +31,16 @@ def get_status(hw_id):
     c.execute('SELECT status, token FROM devices WHERE hw_id = ?', (hw_id,))
     row = c.fetchone()
     conn.close()
-    if row:
-        return jsonify({"status": row[0], "token": row[1]})
-    return jsonify({"status": "unlocked", "token": ""})
+    return jsonify({"status": row[0], "token": row[1]}) if row else jsonify({"status": "unlocked", "token": ""})
+
+@app.route('/status/all', methods=['GET'])
+def get_all_status():
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute('SELECT hw_id, name, status, token FROM devices')
+    rows = c.fetchall()
+    conn.close()
+    return jsonify({row[0]: {"name": row[1], "status": row[2], "token": row[3]} for row in rows})
 
 @app.route('/lock/<hw_id>', methods=['POST'])
 def lock_device(hw_id):
