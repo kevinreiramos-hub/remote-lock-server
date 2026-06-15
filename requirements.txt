@@ -1,0 +1,6 @@
+flask
+gunicorn
+requests
+customtkinter
+wmi
+pywin32
