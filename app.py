@@ -2,35 +2,32 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Replace with a real DB (PostgreSQL) for production
-database = {
-    "PC-001": {"key": "KEY-123", "status": "unlocked"},
-    "PC-002": {"key": "KEY-456", "status": "unlocked"}
-}
+# Format: { "HW_ID": {"name": "User-PC", "status": "unlocked", "token": ""} }
+database = {}
 
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
-    if database.get(data['device_id'], {}).get('key') == data['license_key']:
-        return jsonify({"success": True})
-    return jsonify({"success": False}), 403
+    hw_id = data['hw_id']
+    database[hw_id] = {"name": data['name'], "status": "unlocked", "token": ""}
+    return jsonify({"success": True})
 
-@app.route('/status/<device_id>', methods=['GET'])
-def get_status(device_id):
-    return jsonify({"action": database.get(device_id, {}).get("status", "unlocked")})
+@app.route('/status/<hw_id>', methods=['GET'])
+def get_status(hw_id):
+    return jsonify(database.get(hw_id, {"status": "unlocked", "token": ""}))
 
-@app.route('/lock/<device_id>', methods=['POST'])
-def lock_device(device_id):
-    if device_id in database:
-        database[device_id]["status"] = "locked"
+@app.route('/lock/<hw_id>', methods=['POST'])
+def lock_device(hw_id):
+    token = request.json.get("token")
+    if hw_id in database:
+        database[hw_id].update({"status": "locked", "token": token})
         return jsonify({"success": True})
     return jsonify({"success": False}), 404
 
-# ADD THIS NEW ROUTE
-@app.route('/unlock/<device_id>', methods=['POST'])
-def unlock_device(device_id):
-    if device_id in database:
-        database[device_id]["status"] = "unlocked"
+@app.route('/unlock/<hw_id>', methods=['POST'])
+def unlock_device(hw_id):
+    if hw_id in database:
+        database[hw_id].update({"status": "unlocked", "token": ""})
         return jsonify({"success": True})
     return jsonify({"success": False}), 404
 
