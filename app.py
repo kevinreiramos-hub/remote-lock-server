@@ -26,5 +26,13 @@ def lock_device(device_id):
         return jsonify({"success": True})
     return jsonify({"success": False}), 404
 
+# ADD THIS NEW ROUTE
+@app.route('/unlock/<device_id>', methods=['POST'])
+def unlock_device(device_id):
+    if device_id in database:
+        database[device_id]["status"] = "unlocked"
+        return jsonify({"success": True})
+    return jsonify({"success": False}), 404
+
 if __name__ == '__main__':
     app.run()
