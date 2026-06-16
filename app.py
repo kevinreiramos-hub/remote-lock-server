@@ -55,9 +55,8 @@ def init_db():
                      PRIMARY KEY (hw_id, org))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS binding_credential
                     (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS device_trials
-                    (org TEXT, device_id TEXT, trial_start TEXT,
-                     PRIMARY KEY (org, device_id))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS org_trials
+                    (org TEXT PRIMARY KEY, trial_start TEXT)''')
     try:
         conn.execute("ALTER TABLE binding_credential ADD COLUMN version TEXT")
     except Exception:
@@ -95,22 +94,20 @@ def _current_version(conn, org):
     return row["version"] if row else None
 
 
-def _trial_info(conn, org, device_id):
-    """Return demo-trial status for a single device. Starts its clock on first
-    contact. Each device (by hardware id) gets its own independent trial."""
+def _trial_info(conn, org, device_id=None):
+    """Return demo-trial status for a COMPANY. One clock per company: it starts
+    on first contact (by the dashboard or any device), and every device plus the
+    dashboard of that company share the same expiration. device_id is ignored."""
     if org in LICENSED:
         return {"expired": False, "licensed": True, "seconds_left": None, "expires_at": None}
-    if not device_id:
-        return {"expired": False, "licensed": False, "seconds_left": None, "expires_at": None}
     now = datetime.now(timezone.utc)
-    row = conn.execute('SELECT trial_start FROM device_trials WHERE org = ? AND device_id = ?',
-                       (org, device_id)).fetchone()
+    row = conn.execute('SELECT trial_start FROM org_trials WHERE org = ?', (org,)).fetchone()
     if row and row["trial_start"]:
         start = datetime.fromisoformat(row["trial_start"])
     else:
         start = now
-        conn.execute('INSERT OR REPLACE INTO device_trials (org, device_id, trial_start) '
-                     'VALUES (?, ?, ?)', (org, device_id, start.isoformat()))
+        conn.execute('INSERT OR REPLACE INTO org_trials (org, trial_start) VALUES (?, ?)',
+                     (org, start.isoformat()))
         conn.commit()
     expires = start + timedelta(minutes=TRIAL_MINUTES)
     left = (expires - now).total_seconds()
