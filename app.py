@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from functools import wraps
-import sqlite3, os, json
+import sqlite3, os, json, secrets
 
 app = Flask(__name__)
 DB = "database.db"
@@ -10,13 +10,7 @@ DB = "database.db"
 # Each company has its own secret keys. A DEVICE key lets a client register and
 # read its own status; an ADMIN key (held only by the company's dashboard) can
 # list/lock/unlock devices and manage the binding credential. Both map to the
-# same company "org".
-#
-# Configure on Render -> Environment with COMPANIES_JSON, e.g.:
-# {
-#   "device_keys": { "ACME-DEVICE-9f3a..": "acme" },
-#   "admin_keys":  { "ACME-ADMIN-1b2c..":  "acme" }
-# }
+# same company "org". Configure on Render -> Environment with COMPANIES_JSON.
 # ---------------------------------------------------------------------------
 def _load_companies():
     raw = os.environ.get("COMPANIES_JSON")
@@ -46,17 +40,21 @@ def init_db():
     conn.execute('''CREATE TABLE IF NOT EXISTS devices
                     (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
                      PRIMARY KEY (hw_id, org))''')
-    # One binding credential per company. Stored retrievably so the dashboard
-    # can display it (it is a shared binding secret, not a hashed login).
+    # One binding credential per company, stamped with a version that changes
+    # whenever the credential is updated. Devices that bound under an old
+    # version must re-bind. Stored retrievably so the dashboard can show it.
     conn.execute('''CREATE TABLE IF NOT EXISTS binding_credential
-                    (org TEXT PRIMARY KEY, username TEXT, password TEXT)''')
+                    (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
+    try:  # migrate older tables that lack the version column
+        conn.execute("ALTER TABLE binding_credential ADD COLUMN version TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 init_db()
 
 
 def require_device(f):
-    """Client-level access: device key OR admin key, scoped to that org."""
     @wraps(f)
     def wrapper(*args, **kwargs):
         key = request.headers.get("X-Company-Key", "")
@@ -68,7 +66,6 @@ def require_device(f):
 
 
 def require_admin(f):
-    """Dashboard-level access: admin key only."""
     @wraps(f)
     def wrapper(*args, **kwargs):
         key = request.headers.get("X-Company-Key", "")
@@ -77,6 +74,12 @@ def require_admin(f):
             return jsonify({"error": "unauthorized"}), 401
         return f(org, *args, **kwargs)
     return wrapper
+
+
+def _current_version(conn, org):
+    row = conn.execute('SELECT version FROM binding_credential WHERE org = ?',
+                       (org,)).fetchone()
+    return row["version"] if row else None
 
 
 @app.route('/', methods=['GET'])
@@ -88,25 +91,34 @@ def health():
 @app.route('/login', methods=['POST'])
 @require_device
 def login(org):
-    """Client first-launch enrollment: validate the company's binding credential."""
+    """Client first-launch enrollment. Returns the credential version to store."""
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
     conn = get_db()
-    row = conn.execute('SELECT username, password FROM binding_credential WHERE org = ?',
+    row = conn.execute('SELECT username, password, version FROM binding_credential WHERE org = ?',
                        (org,)).fetchone()
     conn.close()
     if row and row["username"] == username and row["password"] == password:
-        return jsonify({"success": True})
+        return jsonify({"success": True, "version": row["version"]})
     return jsonify({"error": "invalid credentials"}), 401
+
+
+@app.route('/version', methods=['GET'])
+@require_device
+def get_version(org):
+    """Lets a client check whether the binding credential has changed."""
+    conn = get_db()
+    version = _current_version(conn, org)
+    conn.close()
+    return jsonify({"version": version})
 
 
 @app.route('/admin/credentials', methods=['GET'])
 @require_admin
 def get_credential(org):
-    """Return the company's single binding credential so the dashboard can show it."""
     conn = get_db()
     row = conn.execute('SELECT username, password FROM binding_credential WHERE org = ?',
                        (org,)).fetchone()
@@ -119,15 +131,18 @@ def get_credential(org):
 @app.route('/admin/credentials', methods=['POST'])
 @require_admin
 def set_credential(org):
-    """Create or replace the company's single binding credential."""
+    """Create or change the binding credential. Bumps the version and clears all
+    devices for this company, so every device must re-bind with the new one."""
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
+    version = secrets.token_hex(8)
     conn = get_db()
-    conn.execute('INSERT OR REPLACE INTO binding_credential (org, username, password) VALUES (?, ?, ?)',
-                 (org, username, password))
+    conn.execute('INSERT OR REPLACE INTO binding_credential (org, username, password, version) '
+                 'VALUES (?, ?, ?, ?)', (org, username, password, version))
+    conn.execute('DELETE FROM devices WHERE org = ?', (org,))   # force re-bind
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -155,10 +170,13 @@ def get_status(org, hw_id):
     conn = get_db()
     row = conn.execute('SELECT status, token FROM devices WHERE hw_id = ? AND org = ?',
                        (hw_id, org)).fetchone()
+    cred_version = _current_version(conn, org)
     conn.close()
     if row:
-        return jsonify({"status": row["status"], "token": row["token"], "found": True})
-    return jsonify({"status": "unlocked", "token": "", "found": False})
+        return jsonify({"status": row["status"], "token": row["token"],
+                        "found": True, "cred_version": cred_version})
+    return jsonify({"status": "unlocked", "token": "",
+                    "found": False, "cred_version": cred_version})
 
 
 @app.route('/status/all', methods=['GET'])
