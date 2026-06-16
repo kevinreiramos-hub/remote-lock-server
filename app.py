@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 from functools import wraps
-from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3, os, json
 
 app = Flask(__name__)
@@ -10,8 +9,8 @@ DB = "database.db"
 # MULTI-TENANCY
 # Each company has its own secret keys. A DEVICE key lets a client register and
 # read its own status; an ADMIN key (held only by the company's dashboard) can
-# list all devices, lock/unlock them, and manage connection credentials. Both
-# keys map to the same company "org".
+# list/lock/unlock devices and manage the binding credential. Both map to the
+# same company "org".
 #
 # Configure on Render -> Environment with COMPANIES_JSON, e.g.:
 # {
@@ -47,9 +46,10 @@ def init_db():
     conn.execute('''CREATE TABLE IF NOT EXISTS devices
                     (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
                      PRIMARY KEY (hw_id, org))''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS credentials
-                    (org TEXT, username TEXT, pw_hash TEXT,
-                     PRIMARY KEY (org, username))''')
+    # One binding credential per company. Stored retrievably so the dashboard
+    # can display it (it is a shared binding secret, not a hashed login).
+    conn.execute('''CREATE TABLE IF NOT EXISTS binding_credential
+                    (org TEXT PRIMARY KEY, username TEXT, password TEXT)''')
     conn.commit()
     conn.close()
 init_db()
@@ -84,62 +84,52 @@ def health():
     return jsonify({"status": "ok", "service": "remote-lock-server"})
 
 
-# ---------------- CLIENT ENROLLMENT (username / password) ----------------
+# ---------------- BINDING CREDENTIAL ----------------
 @app.route('/login', methods=['POST'])
 @require_device
 def login(org):
+    """Client first-launch enrollment: validate the company's binding credential."""
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
     conn = get_db()
-    row = conn.execute('SELECT pw_hash FROM credentials WHERE org = ? AND username = ?',
-                       (org, username)).fetchone()
+    row = conn.execute('SELECT username, password FROM binding_credential WHERE org = ?',
+                       (org,)).fetchone()
     conn.close()
-    if row and check_password_hash(row["pw_hash"], password):
+    if row and row["username"] == username and row["password"] == password:
         return jsonify({"success": True})
     return jsonify({"error": "invalid credentials"}), 401
 
 
-# ---------------- ADMIN: manage connection credentials ----------------
 @app.route('/admin/credentials', methods=['GET'])
 @require_admin
-def list_credentials(org):
+def get_credential(org):
+    """Return the company's single binding credential so the dashboard can show it."""
     conn = get_db()
-    rows = conn.execute('SELECT username FROM credentials WHERE org = ? ORDER BY username',
-                        (org,)).fetchall()
+    row = conn.execute('SELECT username, password FROM binding_credential WHERE org = ?',
+                       (org,)).fetchone()
     conn.close()
-    return jsonify({"usernames": [r["username"] for r in rows]})
+    if row:
+        return jsonify({"set": True, "username": row["username"], "password": row["password"]})
+    return jsonify({"set": False})
 
 
 @app.route('/admin/credentials', methods=['POST'])
 @require_admin
 def set_credential(org):
+    """Create or replace the company's single binding credential."""
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
     conn = get_db()
-    conn.execute('INSERT OR REPLACE INTO credentials (org, username, pw_hash) VALUES (?, ?, ?)',
-                 (org, username, generate_password_hash(password)))
+    conn.execute('INSERT OR REPLACE INTO binding_credential (org, username, password) VALUES (?, ?, ?)',
+                 (org, username, password))
     conn.commit()
     conn.close()
-    return jsonify({"success": True})
-
-
-@app.route('/admin/credentials/<username>', methods=['DELETE'])
-@require_admin
-def delete_credential(org, username):
-    conn = get_db()
-    cur = conn.execute('DELETE FROM credentials WHERE org = ? AND username = ?',
-                       (org, username))
-    conn.commit()
-    affected = cur.rowcount
-    conn.close()
-    if affected == 0:
-        return jsonify({"error": "not found"}), 404
     return jsonify({"success": True})
 
 
