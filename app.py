@@ -1,16 +1,21 @@
 from flask import Flask, request, jsonify
 from functools import wraps
+from datetime import datetime, timedelta, timezone
 import sqlite3, os, json, secrets
 
 app = Flask(__name__)
 DB = "database.db"
 
 # ---------------------------------------------------------------------------
-# MULTI-TENANCY
-# Each company has its own secret keys. A DEVICE key lets a client register and
-# read its own status; an ADMIN key (held only by the company's dashboard) can
-# list/lock/unlock devices and manage the binding credential. Both map to the
-# same company "org". Configure on Render -> Environment with COMPANIES_JSON.
+# MULTI-TENANCY + DEMO TRIAL
+# COMPANIES_JSON (Render env) example:
+# {
+#   "device_keys": { "ACME-DEVICE-9f3a..": "acme" },
+#   "admin_keys":  { "ACME-ADMIN-1b2c..":  "acme" },
+#   "licensed":    [ "bigcorp" ]        # orgs here never expire (paying customers)
+# }
+# TRIAL_DAYS env controls the demo length (default 1). Use a fraction to test,
+# e.g. TRIAL_DAYS=0.001 expires in ~90 seconds.
 # ---------------------------------------------------------------------------
 def _load_companies():
     raw = os.environ.get("COMPANIES_JSON")
@@ -22,11 +27,14 @@ def _load_companies():
     return {
         "device_keys": {"DEMO-DEVICE-KEY": "demo"},
         "admin_keys":  {"DEMO-ADMIN-KEY": "demo"},
+        "licensed": [],
     }
 
 _COMPANIES  = _load_companies()
 DEVICE_KEYS = _COMPANIES.get("device_keys", {})
 ADMIN_KEYS  = _COMPANIES.get("admin_keys", {})
+LICENSED    = set(_COMPANIES.get("licensed", []))
+TRIAL_DAYS  = float(os.environ.get("TRIAL_DAYS", "1"))
 
 
 def get_db():
@@ -40,12 +48,11 @@ def init_db():
     conn.execute('''CREATE TABLE IF NOT EXISTS devices
                     (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
                      PRIMARY KEY (hw_id, org))''')
-    # One binding credential per company, stamped with a version that changes
-    # whenever the credential is updated. Devices that bound under an old
-    # version must re-bind. Stored retrievably so the dashboard can show it.
     conn.execute('''CREATE TABLE IF NOT EXISTS binding_credential
                     (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
-    try:  # migrate older tables that lack the version column
+    conn.execute('''CREATE TABLE IF NOT EXISTS org_meta
+                    (org TEXT PRIMARY KEY, trial_start TEXT)''')
+    try:
         conn.execute("ALTER TABLE binding_credential ADD COLUMN version TEXT")
     except Exception:
         pass
@@ -82,16 +89,43 @@ def _current_version(conn, org):
     return row["version"] if row else None
 
 
+def _trial_info(conn, org):
+    """Return demo-trial status for an org. Starts the clock on first contact."""
+    if org in LICENSED:
+        return {"expired": False, "licensed": True, "seconds_left": None, "expires_at": None}
+    now = datetime.now(timezone.utc)
+    row = conn.execute('SELECT trial_start FROM org_meta WHERE org = ?', (org,)).fetchone()
+    if row and row["trial_start"]:
+        start = datetime.fromisoformat(row["trial_start"])
+    else:
+        start = now
+        conn.execute('INSERT OR REPLACE INTO org_meta (org, trial_start) VALUES (?, ?)',
+                     (org, start.isoformat()))
+        conn.commit()
+    expires = start + timedelta(days=TRIAL_DAYS)
+    left = (expires - now).total_seconds()
+    return {"expired": left <= 0, "licensed": False,
+            "seconds_left": int(max(0, left)), "expires_at": expires.isoformat()}
+
+
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"status": "ok", "service": "remote-lock-server"})
+
+
+@app.route('/trial', methods=['GET'])
+@require_device
+def trial(org):
+    conn = get_db()
+    info = _trial_info(conn, org)
+    conn.close()
+    return jsonify(info)
 
 
 # ---------------- BINDING CREDENTIAL ----------------
 @app.route('/login', methods=['POST'])
 @require_device
 def login(org):
-    """Client first-launch enrollment. Returns the credential version to store."""
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
@@ -109,7 +143,6 @@ def login(org):
 @app.route('/version', methods=['GET'])
 @require_device
 def get_version(org):
-    """Lets a client check whether the binding credential has changed."""
     conn = get_db()
     version = _current_version(conn, org)
     conn.close()
@@ -131,8 +164,6 @@ def get_credential(org):
 @app.route('/admin/credentials', methods=['POST'])
 @require_admin
 def set_credential(org):
-    """Create or change the binding credential. Bumps the version and clears all
-    devices for this company, so every device must re-bind with the new one."""
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
@@ -142,7 +173,7 @@ def set_credential(org):
     conn = get_db()
     conn.execute('INSERT OR REPLACE INTO binding_credential (org, username, password, version) '
                  'VALUES (?, ?, ?, ?)', (org, username, password, version))
-    conn.execute('DELETE FROM devices WHERE org = ?', (org,))   # force re-bind
+    conn.execute('DELETE FROM devices WHERE org = ?', (org,))
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -171,12 +202,14 @@ def get_status(org, hw_id):
     row = conn.execute('SELECT status, token FROM devices WHERE hw_id = ? AND org = ?',
                        (hw_id, org)).fetchone()
     cred_version = _current_version(conn, org)
+    info = _trial_info(conn, org)
     conn.close()
+    base = {"cred_version": cred_version, "expired": info["expired"]}
     if row:
-        return jsonify({"status": row["status"], "token": row["token"],
-                        "found": True, "cred_version": cred_version})
-    return jsonify({"status": "unlocked", "token": "",
-                    "found": False, "cred_version": cred_version})
+        base.update({"status": row["status"], "token": row["token"], "found": True})
+    else:
+        base.update({"status": "unlocked", "token": "", "found": False})
+    return jsonify(base)
 
 
 @app.route('/status/all', methods=['GET'])
