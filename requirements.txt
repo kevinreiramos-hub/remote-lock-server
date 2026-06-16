@@ -3,3 +3,4 @@ gunicorn
 requests
 pystray
 Pillow
+psycopg2-binary
