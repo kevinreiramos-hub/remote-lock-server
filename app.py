@@ -65,8 +65,8 @@ def get_status(hw_id):
                        (hw_id,)).fetchone()
     conn.close()
     if row:
-        return jsonify({"status": row["status"], "token": row["token"]})
-    return jsonify({"status": "unlocked", "token": ""})
+        return jsonify({"status": row["status"], "token": row["token"], "found": True})
+    return jsonify({"status": "unlocked", "token": "", "found": False})
 
 
 @app.route('/status/all', methods=['GET'])
