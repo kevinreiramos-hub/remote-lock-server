@@ -52,8 +52,9 @@ def init_db():
                      PRIMARY KEY (hw_id, org))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS binding_credential
                     (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS org_meta
-                    (org TEXT PRIMARY KEY, trial_start TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS device_trials
+                    (org TEXT, device_id TEXT, trial_start TEXT,
+                     PRIMARY KEY (org, device_id))''')
     try:
         conn.execute("ALTER TABLE binding_credential ADD COLUMN version TEXT")
     except Exception:
@@ -91,18 +92,22 @@ def _current_version(conn, org):
     return row["version"] if row else None
 
 
-def _trial_info(conn, org):
-    """Return demo-trial status for an org. Starts the clock on first contact."""
+def _trial_info(conn, org, device_id):
+    """Return demo-trial status for a single device. Starts its clock on first
+    contact. Each device (by hardware id) gets its own independent trial."""
     if org in LICENSED:
         return {"expired": False, "licensed": True, "seconds_left": None, "expires_at": None}
+    if not device_id:
+        return {"expired": False, "licensed": False, "seconds_left": None, "expires_at": None}
     now = datetime.now(timezone.utc)
-    row = conn.execute('SELECT trial_start FROM org_meta WHERE org = ?', (org,)).fetchone()
+    row = conn.execute('SELECT trial_start FROM device_trials WHERE org = ? AND device_id = ?',
+                       (org, device_id)).fetchone()
     if row and row["trial_start"]:
         start = datetime.fromisoformat(row["trial_start"])
     else:
         start = now
-        conn.execute('INSERT OR REPLACE INTO org_meta (org, trial_start) VALUES (?, ?)',
-                     (org, start.isoformat()))
+        conn.execute('INSERT OR REPLACE INTO device_trials (org, device_id, trial_start) '
+                     'VALUES (?, ?, ?)', (org, device_id, start.isoformat()))
         conn.commit()
     expires = start + timedelta(minutes=TRIAL_MINUTES)
     left = (expires - now).total_seconds()
@@ -118,8 +123,9 @@ def health():
 @app.route('/trial', methods=['GET'])
 @require_device
 def trial(org):
+    device_id = request.args.get("device_id") or request.headers.get("X-Device-Id") or ""
     conn = get_db()
-    info = _trial_info(conn, org)
+    info = _trial_info(conn, org, device_id)
     conn.close()
     return jsonify(info)
 
@@ -204,7 +210,7 @@ def get_status(org, hw_id):
     row = conn.execute('SELECT status, token FROM devices WHERE hw_id = ? AND org = ?',
                        (hw_id, org)).fetchone()
     cred_version = _current_version(conn, org)
-    info = _trial_info(conn, org)
+    info = _trial_info(conn, org, hw_id)
     conn.close()
     base = {"cred_version": cred_version, "expired": info["expired"],
             "seconds_left": info["seconds_left"], "licensed": info["licensed"]}
