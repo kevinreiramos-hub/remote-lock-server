@@ -34,10 +34,9 @@ _COMPANIES  = _load_companies()
 DEVICE_KEYS = _COMPANIES.get("device_keys", {})
 ADMIN_KEYS  = _COMPANIES.get("admin_keys", {})
 LICENSED    = set(_COMPANIES.get("licensed", []))
-# TRIAL_MINUTES env controls the demo length.
-# NOTE: set to 5 for testing. For a real 1-day demo set TRIAL_MINUTES=1440
-# (or the TRIAL_MINUTES env var on Render).
-TRIAL_MINUTES = float(os.environ.get("TRIAL_MINUTES", "5"))
+# TRIAL_MINUTES env controls the demo length. Default 1440 = 1 day.
+# For quick testing you can set TRIAL_MINUTES=5 (on Render or your shell).
+TRIAL_MINUTES = float(os.environ.get("TRIAL_MINUTES", "1440"))
 
 
 def get_db():
