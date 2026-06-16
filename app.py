@@ -16,7 +16,7 @@ DB = "database.db"
 # }
 # TRIAL_DAYS env controls the demo length (default 1). Use a fraction to test,
 # e.g. TRIAL_DAYS=0.001 expires in ~90 seconds.
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _load_companies():
     raw = os.environ.get("COMPANIES_JSON")
     if raw:
