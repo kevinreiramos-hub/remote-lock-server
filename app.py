@@ -28,12 +28,15 @@ def _load_companies():
         "device_keys": {"DEMO-DEVICE-KEY": "demo"},
         "admin_keys":  {"DEMO-ADMIN-KEY": "demo"},
         "licensed": [],
+        "admin_logins": {"demo": {"username": "admin", "password": "admin"}},
     }
 
 _COMPANIES  = _load_companies()
 DEVICE_KEYS = _COMPANIES.get("device_keys", {})
 ADMIN_KEYS  = _COMPANIES.get("admin_keys", {})
 LICENSED    = set(_COMPANIES.get("licensed", []))
+# Optional dashboard logins: { "<org>": {"username": "...", "password": "..."} }
+ADMIN_LOGINS = _COMPANIES.get("admin_logins", {})
 # TRIAL_MINUTES env controls the demo length. Default 1440 = 1 day.
 # For quick testing you can set TRIAL_MINUTES=5 (on Render or your shell).
 TRIAL_MINUTES = float(os.environ.get("TRIAL_MINUTES", "1440"))
@@ -118,6 +121,23 @@ def _trial_info(conn, org, device_id):
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"status": "ok", "service": "remote-lock-server"})
+
+
+@app.route('/admin/login', methods=['GET', 'POST'])
+@require_admin
+def admin_login(org):
+    """Dashboard sign-in. GET reports whether a login is configured; POST validates."""
+    cred = ADMIN_LOGINS.get(org)
+    if request.method == 'GET':
+        return jsonify({"required": bool(cred)})
+    if not cred:
+        return jsonify({"success": True})        # no login configured -> allow
+    data = request.get_json(silent=True) or {}
+    u = (data.get("username") or "").strip()
+    p = data.get("password") or ""
+    if cred.get("username") == u and cred.get("password") == p:
+        return jsonify({"success": True})
+    return jsonify({"error": "invalid credentials"}), 401
 
 
 @app.route('/trial', methods=['GET'])
