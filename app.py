@@ -1,16 +1,39 @@
 from flask import Flask, request, jsonify
 from functools import wraps
-import sqlite3, os
+import sqlite3, os, json
 
 app = Flask(__name__)
 DB = "database.db"
 
-# Set this in Render → Environment.  While it is unset, auth is OFF so your
-# existing client/dashboard keep working.  Once you set it, every request must
-# send the matching  X-API-Key  header.
-API_KEY = os.environ.get("API_KEY")
-if not API_KEY:
-    print("WARNING: API_KEY not set — endpoints are UNAUTHENTICATED.")
+# ---------------------------------------------------------------------------
+# MULTI-TENANCY
+# Each company has its own secret keys. A DEVICE key lets a client register and
+# read its own status; an ADMIN key (held only by the company's dashboard) can
+# list all devices and lock/unlock them. Both map to the same company "org".
+#
+# Configure on Render -> Environment with COMPANIES_JSON, e.g.:
+# {
+#   "device_keys": { "ACME-DEVICE-9f3a..": "acme", "BETA-DEVICE-7c1d..": "beta" },
+#   "admin_keys":  { "ACME-ADMIN-1b2c..":  "acme", "BETA-ADMIN-4e5f..":  "beta" }
+# }
+# Add a company by adding one device key and one admin key that share an org id.
+# ---------------------------------------------------------------------------
+def _load_companies():
+    raw = os.environ.get("COMPANIES_JSON")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            print("WARNING: COMPANIES_JSON is not valid JSON; using demo keys.")
+    # Dev fallback ONLY. Replace by setting COMPANIES_JSON in production.
+    return {
+        "device_keys": {"DEMO-DEVICE-KEY": "demo"},
+        "admin_keys":  {"DEMO-ADMIN-KEY": "demo"},
+    }
+
+_COMPANIES  = _load_companies()
+DEVICE_KEYS = _COMPANIES.get("device_keys", {})
+ADMIN_KEYS  = _COMPANIES.get("admin_keys", {})
 
 
 def get_db():
@@ -22,18 +45,34 @@ def get_db():
 def init_db():
     conn = get_db()
     conn.execute('''CREATE TABLE IF NOT EXISTS devices
-                    (hw_id TEXT PRIMARY KEY, name TEXT, status TEXT, token TEXT)''')
+                    (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
+                     PRIMARY KEY (hw_id, org))''')
     conn.commit()
     conn.close()
 init_db()
 
 
-def require_api_key(f):
+def require_device(f):
+    """Client-level access: device key OR admin key, scoped to that org."""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if API_KEY and request.headers.get("X-API-Key") != API_KEY:
+        key = request.headers.get("X-Company-Key", "")
+        org = DEVICE_KEYS.get(key) or ADMIN_KEYS.get(key)
+        if not org:
             return jsonify({"error": "unauthorized"}), 401
-        return f(*args, **kwargs)
+        return f(org, *args, **kwargs)
+    return wrapper
+
+
+def require_admin(f):
+    """Dashboard-level access: admin key only."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get("X-Company-Key", "")
+        org = ADMIN_KEYS.get(key)
+        if not org:
+            return jsonify({"error": "unauthorized"}), 401
+        return f(org, *args, **kwargs)
     return wrapper
 
 
@@ -43,26 +82,26 @@ def health():
 
 
 @app.route('/register', methods=['POST'])
-@require_api_key
-def register():
+@require_device
+def register(org):
     data = request.get_json(silent=True) or {}
     hw_id, name = data.get('hw_id'), data.get('name')
     if not hw_id or not name:
         return jsonify({"error": "hw_id and name are required"}), 400
     conn = get_db()
-    conn.execute('INSERT OR IGNORE INTO devices VALUES (?, ?, ?, ?)',
-                 (hw_id, name, 'unlocked', ''))
+    conn.execute('INSERT OR IGNORE INTO devices VALUES (?, ?, ?, ?, ?)',
+                 (hw_id, org, name, 'unlocked', ''))
     conn.commit()
     conn.close()
     return jsonify({"success": True})
 
 
 @app.route('/status/<hw_id>', methods=['GET'])
-@require_api_key
-def get_status(hw_id):
+@require_device
+def get_status(org, hw_id):
     conn = get_db()
-    row = conn.execute('SELECT status, token FROM devices WHERE hw_id = ?',
-                       (hw_id,)).fetchone()
+    row = conn.execute('SELECT status, token FROM devices WHERE hw_id = ? AND org = ?',
+                       (hw_id, org)).fetchone()
     conn.close()
     if row:
         return jsonify({"status": row["status"], "token": row["token"], "found": True})
@@ -70,23 +109,24 @@ def get_status(hw_id):
 
 
 @app.route('/status/all', methods=['GET'])
-@require_api_key
-def get_all_status():
+@require_admin
+def get_all_status(org):
     conn = get_db()
-    rows = conn.execute('SELECT hw_id, name, status, token FROM devices').fetchall()
+    rows = conn.execute('SELECT hw_id, name, status, token FROM devices WHERE org = ?',
+                        (org,)).fetchall()
     conn.close()
     return jsonify({r["hw_id"]: {"name": r["name"], "status": r["status"],
                                  "token": r["token"]} for r in rows})
 
 
 @app.route('/lock/<hw_id>', methods=['POST'])
-@require_api_key
-def lock_device(hw_id):
+@require_admin
+def lock_device(org, hw_id):
     data = request.get_json(silent=True) or {}
     token = data.get("token", "")
     conn = get_db()
-    cur = conn.execute('UPDATE devices SET status = ?, token = ? WHERE hw_id = ?',
-                       ('locked', token, hw_id))
+    cur = conn.execute('UPDATE devices SET status = ?, token = ? WHERE hw_id = ? AND org = ?',
+                       ('locked', token, hw_id, org))
     conn.commit()
     affected = cur.rowcount
     conn.close()
@@ -96,11 +136,11 @@ def lock_device(hw_id):
 
 
 @app.route('/unlock/<hw_id>', methods=['POST'])
-@require_api_key
-def unlock_device(hw_id):
+@require_device
+def unlock_device(org, hw_id):
     conn = get_db()
-    cur = conn.execute('UPDATE devices SET status = ?, token = ? WHERE hw_id = ?',
-                       ('unlocked', '', hw_id))
+    cur = conn.execute('UPDATE devices SET status = ?, token = ? WHERE hw_id = ? AND org = ?',
+                       ('unlocked', '', hw_id, org))
     conn.commit()
     affected = cur.rowcount
     conn.close()
