@@ -1,21 +1,97 @@
 from flask import Flask, request, jsonify
 from functools import wraps
 from datetime import datetime, timedelta, timezone
-import sqlite3, os, json, secrets
+import os, json, secrets
 
 app = Flask(__name__)
-DB = "database.db"
 
 # ---------------------------------------------------------------------------
-# MULTI-TENANCY + DEMO TRIAL
-# COMPANIES_JSON (Render env) example:
-# {
-#   "device_keys": { "ACME-DEVICE-9f3a..": "acme" },
-#   "admin_keys":  { "ACME-ADMIN-1b2c..":  "acme" },
-#   "licensed":    [ "bigcorp" ]        # orgs here never expire (paying customers)
-# }
-# TRIAL_DAYS env controls the demo length (default 1). Use a fraction to test,
-# e.g. TRIAL_DAYS=0.001 expires in ~90 seconds.
+# DATABASE
+# If DATABASE_URL is set (e.g. a free Neon/Supabase/Render Postgres), data is
+# stored in Postgres and SURVIVES Render free-tier spin-downs and redeploys.
+# If it is not set, we fall back to a local SQLite file (data is NOT durable
+# on Render free tier -- only use SQLite for local testing).
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_PG = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+PH = "%s" if USE_PG else "?"          # SQL parameter placeholder per backend
+
+if USE_PG:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    from psycopg2 import pool as _pgpool
+    _POOL = _pgpool.ThreadedConnectionPool(1, 8, DATABASE_URL,
+                                           cursor_factory=RealDictCursor)
+
+    def get_db():
+        conn = _POOL.getconn()
+        conn.autocommit = True            # each statement commits; no stale transactions
+        return conn
+
+    def put_db(conn):
+        try:
+            _POOL.putconn(conn)
+        except Exception:
+            pass
+else:
+    import sqlite3
+    DB = "database.db"
+
+    def get_db():
+        conn = sqlite3.connect(DB)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def put_db(conn):
+        conn.close()
+
+
+# ---- tiny query helpers that work on both backends ----
+def q1(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    cur.close()
+    return row
+
+def qall(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+def ex(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rc = cur.rowcount
+    if not USE_PG:
+        conn.commit()
+    cur.close()
+    return rc
+
+def insert_ignore(conn, table, cols, vals, conflict):
+    ph = ",".join([PH] * len(vals))
+    cl = ",".join(cols)
+    if USE_PG:
+        ex(conn, f"INSERT INTO {table} ({cl}) VALUES ({ph}) "
+                 f"ON CONFLICT ({conflict}) DO NOTHING", vals)
+    else:
+        ex(conn, f"INSERT OR IGNORE INTO {table} ({cl}) VALUES ({ph})", vals)
+
+def upsert(conn, table, cols, vals, conflict, update_cols):
+    ph = ",".join([PH] * len(vals))
+    cl = ",".join(cols)
+    if USE_PG:
+        sets = ",".join([f"{c}=EXCLUDED.{c}" for c in update_cols])
+        ex(conn, f"INSERT INTO {table} ({cl}) VALUES ({ph}) "
+                 f"ON CONFLICT ({conflict}) DO UPDATE SET {sets}", vals)
+    else:
+        ex(conn, f"INSERT OR REPLACE INTO {table} ({cl}) VALUES ({ph})", vals)
+
+
+# ---------------------------------------------------------------------------
+# MULTI-TENANCY + DEMO TRIAL  (configured via COMPANIES_JSON env)
 # ---------------------------------------------------------------------------
 def _load_companies():
     raw = os.environ.get("COMPANIES_JSON")
@@ -31,45 +107,36 @@ def _load_companies():
         "admin_logins": {"demo": {"username": "admin", "password": "admin"}},
     }
 
-_COMPANIES  = _load_companies()
-DEVICE_KEYS = _COMPANIES.get("device_keys", {})
-ADMIN_KEYS  = _COMPANIES.get("admin_keys", {})
-LICENSED    = set(_COMPANIES.get("licensed", []))
-# Optional dashboard logins: { "<org>": {"username": "...", "password": "..."} }
+_COMPANIES   = _load_companies()
+DEVICE_KEYS  = _COMPANIES.get("device_keys", {})
+ADMIN_KEYS   = _COMPANIES.get("admin_keys", {})
+LICENSED     = set(_COMPANIES.get("licensed", []))
 ADMIN_LOGINS = _COMPANIES.get("admin_logins", {})
-# TRIAL_MINUTES env controls the demo length. Default 1440 = 1 day.
-# For quick testing you can set TRIAL_MINUTES=5 (on Render or your shell).
-TRIAL_MINUTES = float(os.environ.get("TRIAL_MINUTES", "1440"))
-
-
-def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+TRIAL_MINUTES = float(os.environ.get("TRIAL_MINUTES", "1440"))   # default 1 day
 
 
 def init_db():
     conn = get_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS devices
-                    (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
-                     command TEXT DEFAULT '',
-                     PRIMARY KEY (hw_id, org))''')
-    # Add the command column to older databases that predate it.
-    try:
-        conn.execute("ALTER TABLE devices ADD COLUMN command TEXT DEFAULT ''")
-        conn.commit()
-    except Exception:
-        pass
-    conn.execute('''CREATE TABLE IF NOT EXISTS binding_credential
-                    (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS org_trials
-                    (org TEXT PRIMARY KEY, trial_start TEXT)''')
-    try:
-        conn.execute("ALTER TABLE binding_credential ADD COLUMN version TEXT")
-    except Exception:
-        pass
-    conn.commit()
-    conn.close()
+    ex(conn, '''CREATE TABLE IF NOT EXISTS devices
+                (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
+                 command TEXT DEFAULT '',
+                 PRIMARY KEY (hw_id, org))''')
+    ex(conn, '''CREATE TABLE IF NOT EXISTS binding_credential
+                (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
+    ex(conn, '''CREATE TABLE IF NOT EXISTS org_trials
+                (org TEXT PRIMARY KEY, trial_start TEXT)''')
+    # Migrations for databases created before these columns existed.
+    if USE_PG:
+        ex(conn, "ALTER TABLE devices ADD COLUMN IF NOT EXISTS command TEXT DEFAULT ''")
+        ex(conn, "ALTER TABLE binding_credential ADD COLUMN IF NOT EXISTS version TEXT")
+    else:
+        for stmt in ("ALTER TABLE devices ADD COLUMN command TEXT DEFAULT ''",
+                     "ALTER TABLE binding_credential ADD COLUMN version TEXT"):
+            try:
+                ex(conn, stmt)
+            except Exception:
+                pass
+    put_db(conn)
 init_db()
 
 
@@ -96,26 +163,23 @@ def require_admin(f):
 
 
 def _current_version(conn, org):
-    row = conn.execute('SELECT version FROM binding_credential WHERE org = ?',
-                       (org,)).fetchone()
+    row = q1(conn, f'SELECT version FROM binding_credential WHERE org = {PH}', (org,))
     return row["version"] if row else None
 
 
 def _trial_info(conn, org, device_id=None):
-    """Return demo-trial status for a COMPANY. One clock per company: it starts
-    on first contact (by the dashboard or any device), and every device plus the
-    dashboard of that company share the same expiration. device_id is ignored."""
+    """Demo-trial status for a COMPANY. One clock per company: starts on first
+    contact and is shared by the dashboard and all the company's devices."""
     if org in LICENSED:
         return {"expired": False, "licensed": True, "seconds_left": None, "expires_at": None}
     now = datetime.now(timezone.utc)
-    row = conn.execute('SELECT trial_start FROM org_trials WHERE org = ?', (org,)).fetchone()
+    row = q1(conn, f'SELECT trial_start FROM org_trials WHERE org = {PH}', (org,))
     if row and row["trial_start"]:
         start = datetime.fromisoformat(row["trial_start"])
     else:
         start = now
-        conn.execute('INSERT OR REPLACE INTO org_trials (org, trial_start) VALUES (?, ?)',
-                     (org, start.isoformat()))
-        conn.commit()
+        insert_ignore(conn, "org_trials", ["org", "trial_start"],
+                      [org, start.isoformat()], "org")
     expires = start + timedelta(minutes=TRIAL_MINUTES)
     left = (expires - now).total_seconds()
     return {"expired": left <= 0, "licensed": False,
@@ -124,18 +188,18 @@ def _trial_info(conn, org, device_id=None):
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "remote-lock-server"})
+    return jsonify({"status": "ok", "service": "remote-lock-server",
+                    "storage": "postgres" if USE_PG else "sqlite"})
 
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 @require_admin
 def admin_login(org):
-    """Dashboard sign-in. GET reports whether a login is configured; POST validates."""
     cred = ADMIN_LOGINS.get(org)
     if request.method == 'GET':
         return jsonify({"required": bool(cred)})
     if not cred:
-        return jsonify({"success": True})        # no login configured -> allow
+        return jsonify({"success": True})
     data = request.get_json(silent=True) or {}
     u = (data.get("username") or "").strip()
     p = data.get("password") or ""
@@ -150,7 +214,7 @@ def trial(org):
     device_id = request.args.get("device_id") or request.headers.get("X-Device-Id") or ""
     conn = get_db()
     info = _trial_info(conn, org, device_id)
-    conn.close()
+    put_db(conn)
     return jsonify(info)
 
 
@@ -164,9 +228,9 @@ def login(org):
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
     conn = get_db()
-    row = conn.execute('SELECT username, password, version FROM binding_credential WHERE org = ?',
-                       (org,)).fetchone()
-    conn.close()
+    row = q1(conn, f'SELECT username, password, version FROM binding_credential WHERE org = {PH}',
+             (org,))
+    put_db(conn)
     if row and row["username"] == username and row["password"] == password:
         return jsonify({"success": True, "version": row["version"]})
     return jsonify({"error": "invalid credentials"}), 401
@@ -177,7 +241,7 @@ def login(org):
 def get_version(org):
     conn = get_db()
     version = _current_version(conn, org)
-    conn.close()
+    put_db(conn)
     return jsonify({"version": version})
 
 
@@ -185,9 +249,8 @@ def get_version(org):
 @require_admin
 def get_credential(org):
     conn = get_db()
-    row = conn.execute('SELECT username, password FROM binding_credential WHERE org = ?',
-                       (org,)).fetchone()
-    conn.close()
+    row = q1(conn, f'SELECT username, password FROM binding_credential WHERE org = {PH}', (org,))
+    put_db(conn)
     if row:
         return jsonify({"set": True, "username": row["username"], "password": row["password"]})
     return jsonify({"set": False})
@@ -203,11 +266,12 @@ def set_credential(org):
         return jsonify({"error": "username and password required"}), 400
     version = secrets.token_hex(8)
     conn = get_db()
-    conn.execute('INSERT OR REPLACE INTO binding_credential (org, username, password, version) '
-                 'VALUES (?, ?, ?, ?)', (org, username, password, version))
-    conn.execute('DELETE FROM devices WHERE org = ?', (org,))
-    conn.commit()
-    conn.close()
+    upsert(conn, "binding_credential",
+           ["org", "username", "password", "version"],
+           [org, username, password, version],
+           "org", ["username", "password", "version"])
+    ex(conn, f'DELETE FROM devices WHERE org = {PH}', (org,))
+    put_db(conn)
     return jsonify({"success": True})
 
 
@@ -220,11 +284,11 @@ def register(org):
     if not hw_id or not name:
         return jsonify({"error": "hw_id and name are required"}), 400
     conn = get_db()
-    conn.execute('INSERT OR IGNORE INTO devices (hw_id, org, name, status, token, command) '
-                 'VALUES (?, ?, ?, ?, ?, ?)',
-                 (hw_id, org, name, 'unlocked', '', ''))
-    conn.commit()
-    conn.close()
+    insert_ignore(conn, "devices",
+                  ["hw_id", "org", "name", "status", "token", "command"],
+                  [hw_id, org, name, 'unlocked', '', ''],
+                  "hw_id, org")
+    put_db(conn)
     return jsonify({"success": True})
 
 
@@ -232,18 +296,16 @@ def register(org):
 @require_device
 def get_status(org, hw_id):
     conn = get_db()
-    row = conn.execute('SELECT status, token, command FROM devices WHERE hw_id = ? AND org = ?',
-                       (hw_id, org)).fetchone()
+    row = q1(conn, f'SELECT status, token, command FROM devices WHERE hw_id = {PH} AND org = {PH}',
+             (hw_id, org))
     command = ""
     if row and row["command"]:
         command = row["command"]
-        # Deliver the command at most once, so a restart can't loop on it.
-        conn.execute('UPDATE devices SET command = ? WHERE hw_id = ? AND org = ?',
-                     ('', hw_id, org))
-        conn.commit()
+        ex(conn, f'UPDATE devices SET command = {PH} WHERE hw_id = {PH} AND org = {PH}',
+           ('', hw_id, org))
     cred_version = _current_version(conn, org)
     info = _trial_info(conn, org, hw_id)
-    conn.close()
+    put_db(conn)
     base = {"cred_version": cred_version, "expired": info["expired"],
             "seconds_left": info["seconds_left"], "licensed": info["licensed"],
             "command": command}
@@ -258,9 +320,8 @@ def get_status(org, hw_id):
 @require_admin
 def get_all_status(org):
     conn = get_db()
-    rows = conn.execute('SELECT hw_id, name, status, token FROM devices WHERE org = ?',
-                        (org,)).fetchall()
-    conn.close()
+    rows = qall(conn, f'SELECT hw_id, name, status, token FROM devices WHERE org = {PH}', (org,))
+    put_db(conn)
     return jsonify({r["hw_id"]: {"name": r["name"], "status": r["status"],
                                  "token": r["token"]} for r in rows})
 
@@ -271,11 +332,10 @@ def lock_device(org, hw_id):
     data = request.get_json(silent=True) or {}
     token = data.get("token", "")
     conn = get_db()
-    cur = conn.execute('UPDATE devices SET status = ?, token = ? WHERE hw_id = ? AND org = ?',
-                       ('locked', token, hw_id, org))
-    conn.commit()
-    affected = cur.rowcount
-    conn.close()
+    affected = ex(conn, f'UPDATE devices SET status = {PH}, token = {PH} '
+                        f'WHERE hw_id = {PH} AND org = {PH}',
+                  ('locked', token, hw_id, org))
+    put_db(conn)
     if affected == 0:
         return jsonify({"error": "device not found"}), 404
     return jsonify({"success": True})
@@ -285,11 +345,10 @@ def lock_device(org, hw_id):
 @require_device
 def unlock_device(org, hw_id):
     conn = get_db()
-    cur = conn.execute('UPDATE devices SET status = ?, token = ? WHERE hw_id = ? AND org = ?',
-                       ('unlocked', '', hw_id, org))
-    conn.commit()
-    affected = cur.rowcount
-    conn.close()
+    affected = ex(conn, f'UPDATE devices SET status = {PH}, token = {PH} '
+                        f'WHERE hw_id = {PH} AND org = {PH}',
+                  ('unlocked', '', hw_id, org))
+    put_db(conn)
     if affected == 0:
         return jsonify({"error": "device not found"}), 404
     return jsonify({"success": True})
@@ -297,11 +356,9 @@ def unlock_device(org, hw_id):
 
 def _queue_command(org, hw_id, command):
     conn = get_db()
-    cur = conn.execute('UPDATE devices SET command = ? WHERE hw_id = ? AND org = ?',
-                       (command, hw_id, org))
-    conn.commit()
-    affected = cur.rowcount
-    conn.close()
+    affected = ex(conn, f'UPDATE devices SET command = {PH} WHERE hw_id = {PH} AND org = {PH}',
+                  (command, hw_id, org))
+    put_db(conn)
     if affected == 0:
         return jsonify({"error": "device not found"}), 404
     return jsonify({"success": True})
