@@ -34,7 +34,10 @@ _COMPANIES  = _load_companies()
 DEVICE_KEYS = _COMPANIES.get("device_keys", {})
 ADMIN_KEYS  = _COMPANIES.get("admin_keys", {})
 LICENSED    = set(_COMPANIES.get("licensed", []))
-TRIAL_DAYS  = float(os.environ.get("TRIAL_DAYS", "1"))
+# TRIAL_MINUTES env controls the demo length.
+# NOTE: set to 5 for testing. For a real 1-day demo set TRIAL_MINUTES=1440
+# (or the TRIAL_MINUTES env var on Render).
+TRIAL_MINUTES = float(os.environ.get("TRIAL_MINUTES", "5"))
 
 
 def get_db():
@@ -102,7 +105,7 @@ def _trial_info(conn, org):
         conn.execute('INSERT OR REPLACE INTO org_meta (org, trial_start) VALUES (?, ?)',
                      (org, start.isoformat()))
         conn.commit()
-    expires = start + timedelta(days=TRIAL_DAYS)
+    expires = start + timedelta(minutes=TRIAL_MINUTES)
     left = (expires - now).total_seconds()
     return {"expired": left <= 0, "licensed": False,
             "seconds_left": int(max(0, left)), "expires_at": expires.isoformat()}
@@ -204,7 +207,8 @@ def get_status(org, hw_id):
     cred_version = _current_version(conn, org)
     info = _trial_info(conn, org)
     conn.close()
-    base = {"cred_version": cred_version, "expired": info["expired"]}
+    base = {"cred_version": cred_version, "expired": info["expired"],
+            "seconds_left": info["seconds_left"], "licensed": info["licensed"]}
     if row:
         base.update({"status": row["status"], "token": row["token"], "found": True})
     else:
