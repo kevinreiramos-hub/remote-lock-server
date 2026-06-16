@@ -52,7 +52,14 @@ def init_db():
     conn = get_db()
     conn.execute('''CREATE TABLE IF NOT EXISTS devices
                     (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
+                     command TEXT DEFAULT '',
                      PRIMARY KEY (hw_id, org))''')
+    # Add the command column to older databases that predate it.
+    try:
+        conn.execute("ALTER TABLE devices ADD COLUMN command TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass
     conn.execute('''CREATE TABLE IF NOT EXISTS binding_credential
                     (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS org_trials
@@ -213,8 +220,9 @@ def register(org):
     if not hw_id or not name:
         return jsonify({"error": "hw_id and name are required"}), 400
     conn = get_db()
-    conn.execute('INSERT OR IGNORE INTO devices VALUES (?, ?, ?, ?, ?)',
-                 (hw_id, org, name, 'unlocked', ''))
+    conn.execute('INSERT OR IGNORE INTO devices (hw_id, org, name, status, token, command) '
+                 'VALUES (?, ?, ?, ?, ?, ?)',
+                 (hw_id, org, name, 'unlocked', '', ''))
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -224,13 +232,21 @@ def register(org):
 @require_device
 def get_status(org, hw_id):
     conn = get_db()
-    row = conn.execute('SELECT status, token FROM devices WHERE hw_id = ? AND org = ?',
+    row = conn.execute('SELECT status, token, command FROM devices WHERE hw_id = ? AND org = ?',
                        (hw_id, org)).fetchone()
+    command = ""
+    if row and row["command"]:
+        command = row["command"]
+        # Deliver the command at most once, so a restart can't loop on it.
+        conn.execute('UPDATE devices SET command = ? WHERE hw_id = ? AND org = ?',
+                     ('', hw_id, org))
+        conn.commit()
     cred_version = _current_version(conn, org)
     info = _trial_info(conn, org, hw_id)
     conn.close()
     base = {"cred_version": cred_version, "expired": info["expired"],
-            "seconds_left": info["seconds_left"], "licensed": info["licensed"]}
+            "seconds_left": info["seconds_left"], "licensed": info["licensed"],
+            "command": command}
     if row:
         base.update({"status": row["status"], "token": row["token"], "found": True})
     else:
@@ -277,6 +293,30 @@ def unlock_device(org, hw_id):
     if affected == 0:
         return jsonify({"error": "device not found"}), 404
     return jsonify({"success": True})
+
+
+def _queue_command(org, hw_id, command):
+    conn = get_db()
+    cur = conn.execute('UPDATE devices SET command = ? WHERE hw_id = ? AND org = ?',
+                       (command, hw_id, org))
+    conn.commit()
+    affected = cur.rowcount
+    conn.close()
+    if affected == 0:
+        return jsonify({"error": "device not found"}), 404
+    return jsonify({"success": True})
+
+
+@app.route('/restart/<hw_id>', methods=['POST'])
+@require_admin
+def restart_device(org, hw_id):
+    return _queue_command(org, hw_id, 'restart')
+
+
+@app.route('/shutdown/<hw_id>', methods=['POST'])
+@require_admin
+def shutdown_device(org, hw_id):
+    return _queue_command(org, hw_id, 'shutdown')
 
 
 if __name__ == '__main__':
