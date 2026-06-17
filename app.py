@@ -152,7 +152,7 @@ def init_db():
 init_db()
 
 # How long after the last check-in a device is still considered "online".
-ONLINE_WINDOW = 60         # seconds
+ONLINE_WINDOW = 45         # seconds (grace so a brief network blip won't flicker)
 HEARTBEAT_THROTTLE = 8     # only rewrite last_seen at most this often (per device)
 
 def _iso_now():
