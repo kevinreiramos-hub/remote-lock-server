@@ -132,6 +132,9 @@ def init_db():
     ex(conn, '''CREATE TABLE IF NOT EXISTS screenshots
                 (hw_id TEXT, org TEXT, img TEXT, created_at TEXT,
                  PRIMARY KEY (hw_id, org))''')
+    ex(conn, '''CREATE TABLE IF NOT EXISTS messages
+                (hw_id TEXT, org TEXT, body TEXT, created_at TEXT,
+                 PRIMARY KEY (hw_id, org))''')
     # Migrations for databases created before these columns existed.
     _new_cols = ["command TEXT DEFAULT ''", "brand TEXT DEFAULT ''", "ip TEXT DEFAULT ''",
                  "last_login TEXT DEFAULT ''", "uptime TEXT DEFAULT ''",
@@ -177,6 +180,11 @@ def rget(row, key, default=""):
     except (KeyError, IndexError, TypeError):
         return default
     return default if v is None else v
+
+MESSAGE_TTL = 60          # seconds a pop-up message is kept before auto-deletion
+def _prune_messages(conn):
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=MESSAGE_TTL)).isoformat()
+    ex(conn, f'DELETE FROM messages WHERE created_at < {PH}', (cutoff,))
 
 
 def require_device(f):
@@ -366,10 +374,17 @@ def get_status(org, hw_id):
         ex(conn, f'UPDATE devices SET {", ".join(sets)} WHERE hw_id = {PH} AND org = {PH}', vals)
     cred_version = _current_version(conn, org)
     info = _trial_info(conn, org, hw_id)
+    # One-shot pop-up message delivery (also auto-expires after MESSAGE_TTL).
+    _prune_messages(conn)
+    message = ""
+    mrow = q1(conn, f'SELECT body FROM messages WHERE hw_id = {PH} AND org = {PH}', (hw_id, org))
+    if mrow and rget(mrow, "body"):
+        message = rget(mrow, "body")
+        ex(conn, f'DELETE FROM messages WHERE hw_id = {PH} AND org = {PH}', (hw_id, org))
     put_db(conn)
     base = {"cred_version": cred_version, "expired": info["expired"],
             "seconds_left": info["seconds_left"], "licensed": info["licensed"],
-            "command": command}
+            "command": command, "message": message}
     if row:
         base.update({"status": row["status"], "token": row["token"], "found": True})
     else:
@@ -481,6 +496,22 @@ def _prune_screenshots(conn):
 def request_screenshot(org, hw_id):
     # queued like restart/shutdown; the device picks it up on its next status poll
     return _queue_command(org, hw_id, 'screenshot')
+
+@app.route('/admin/message/<hw_id>', methods=['POST'])
+@require_admin
+def send_message(org, hw_id):
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"error": "empty message"}), 400
+    conn = get_db()
+    _prune_messages(conn)
+    upsert(conn, "messages",
+           ["hw_id", "org", "body", "created_at"],
+           [hw_id, org, body, _iso_now()],
+           "hw_id, org", ["body", "created_at"])
+    put_db(conn)
+    return jsonify({"success": True})
 
 @app.route('/screenshot/<hw_id>', methods=['POST'])
 @require_device
