@@ -129,6 +129,9 @@ def init_db():
                 (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
     ex(conn, '''CREATE TABLE IF NOT EXISTS org_trials
                 (org TEXT PRIMARY KEY, trial_start TEXT)''')
+    ex(conn, '''CREATE TABLE IF NOT EXISTS screenshots
+                (hw_id TEXT, org TEXT, img TEXT, created_at TEXT,
+                 PRIMARY KEY (hw_id, org))''')
     # Migrations for databases created before these columns existed.
     _new_cols = ["command TEXT DEFAULT ''", "brand TEXT DEFAULT ''", "ip TEXT DEFAULT ''",
                  "last_login TEXT DEFAULT ''", "uptime TEXT DEFAULT ''",
@@ -464,6 +467,49 @@ def restart_device(org, hw_id):
 @require_admin
 def shutdown_device(org, hw_id):
     return _queue_command(org, hw_id, 'shutdown')
+
+
+# ---------------- SCREENSHOTS (auto-deleted after SCREENSHOT_TTL) ----------------
+SCREENSHOT_TTL = 60        # seconds a screenshot is kept before auto-deletion
+
+def _prune_screenshots(conn):
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=SCREENSHOT_TTL)).isoformat()
+    ex(conn, f'DELETE FROM screenshots WHERE created_at < {PH}', (cutoff,))
+
+@app.route('/admin/request-screenshot/<hw_id>', methods=['POST'])
+@require_admin
+def request_screenshot(org, hw_id):
+    # queued like restart/shutdown; the device picks it up on its next status poll
+    return _queue_command(org, hw_id, 'screenshot')
+
+@app.route('/screenshot/<hw_id>', methods=['POST'])
+@require_device
+def upload_screenshot(org, hw_id):
+    data = request.get_json(silent=True) or {}
+    img = data.get("image") or ""
+    if not img:
+        return jsonify({"error": "no image"}), 400
+    conn = get_db()
+    _prune_screenshots(conn)
+    upsert(conn, "screenshots",
+           ["hw_id", "org", "img", "created_at"],
+           [hw_id, org, img, _iso_now()],
+           "hw_id, org", ["img", "created_at"])
+    put_db(conn)
+    return jsonify({"success": True})
+
+@app.route('/admin/screenshot/<hw_id>', methods=['GET'])
+@require_admin
+def get_screenshot(org, hw_id):
+    conn = get_db()
+    _prune_screenshots(conn)
+    row = q1(conn, f'SELECT img, created_at FROM screenshots WHERE hw_id = {PH} AND org = {PH}',
+             (hw_id, org))
+    put_db(conn)
+    if not row:
+        return jsonify({"ready": False})
+    return jsonify({"ready": True, "image": rget(row, "img"),
+                    "created_at": rget(row, "created_at")})
 
 
 if __name__ == '__main__':
