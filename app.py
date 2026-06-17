@@ -120,24 +120,60 @@ def init_db():
     ex(conn, '''CREATE TABLE IF NOT EXISTS devices
                 (hw_id TEXT, org TEXT, name TEXT, status TEXT, token TEXT,
                  command TEXT DEFAULT '',
+                 brand TEXT DEFAULT '', ip TEXT DEFAULT '',
+                 last_login TEXT DEFAULT '', uptime TEXT DEFAULT '',
+                 rep_user TEXT DEFAULT '', grp TEXT DEFAULT '',
+                 user_override TEXT DEFAULT '', last_seen TEXT DEFAULT '',
                  PRIMARY KEY (hw_id, org))''')
     ex(conn, '''CREATE TABLE IF NOT EXISTS binding_credential
                 (org TEXT PRIMARY KEY, username TEXT, password TEXT, version TEXT)''')
     ex(conn, '''CREATE TABLE IF NOT EXISTS org_trials
                 (org TEXT PRIMARY KEY, trial_start TEXT)''')
     # Migrations for databases created before these columns existed.
+    _new_cols = ["command TEXT DEFAULT ''", "brand TEXT DEFAULT ''", "ip TEXT DEFAULT ''",
+                 "last_login TEXT DEFAULT ''", "uptime TEXT DEFAULT ''",
+                 "rep_user TEXT DEFAULT ''", "grp TEXT DEFAULT ''",
+                 "user_override TEXT DEFAULT ''", "last_seen TEXT DEFAULT ''"]
     if USE_PG:
-        ex(conn, "ALTER TABLE devices ADD COLUMN IF NOT EXISTS command TEXT DEFAULT ''")
+        for col in _new_cols:
+            ex(conn, f"ALTER TABLE devices ADD COLUMN IF NOT EXISTS {col}")
         ex(conn, "ALTER TABLE binding_credential ADD COLUMN IF NOT EXISTS version TEXT")
     else:
-        for stmt in ("ALTER TABLE devices ADD COLUMN command TEXT DEFAULT ''",
-                     "ALTER TABLE binding_credential ADD COLUMN version TEXT"):
+        for col in _new_cols:
             try:
-                ex(conn, stmt)
+                ex(conn, f"ALTER TABLE devices ADD COLUMN {col}")
             except Exception:
                 pass
+        try:
+            ex(conn, "ALTER TABLE binding_credential ADD COLUMN version TEXT")
+        except Exception:
+            pass
     put_db(conn)
 init_db()
+
+# How long after the last check-in a device is still considered "online".
+ONLINE_WINDOW = 60         # seconds
+HEARTBEAT_THROTTLE = 8     # only rewrite last_seen at most this often (per device)
+
+def _iso_now():
+    return datetime.now(timezone.utc).isoformat()
+
+def _age_seconds(iso_str):
+    """Seconds since the given ISO timestamp, or a large number if unparseable."""
+    if not iso_str:
+        return 10 ** 9
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso_str)).total_seconds()
+    except Exception:
+        return 10 ** 9
+
+def rget(row, key, default=""):
+    """Read a column from a row on either backend (sqlite3.Row has no .get)."""
+    try:
+        v = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if v is None else v
 
 
 def require_device(f):
@@ -283,11 +319,21 @@ def register(org):
     hw_id, name = data.get('hw_id'), data.get('name')
     if not hw_id or not name:
         return jsonify({"error": "hw_id and name are required"}), 400
+    brand = (data.get('brand') or '').strip()
+    ip = (data.get('ip') or '').strip()
+    last_login = (data.get('last_login') or '').strip()
+    uptime = (data.get('uptime') or '').strip()
+    rep_user = (data.get('user') or '').strip()
     conn = get_db()
     insert_ignore(conn, "devices",
                   ["hw_id", "org", "name", "status", "token", "command"],
                   [hw_id, org, name, 'unlocked', '', ''],
                   "hw_id, org")
+    # always refresh the reported fields + heartbeat (does not touch lock state)
+    ex(conn, f'UPDATE devices SET name = {PH}, brand = {PH}, ip = {PH}, '
+             f'last_login = {PH}, uptime = {PH}, rep_user = {PH}, last_seen = {PH} '
+             f'WHERE hw_id = {PH} AND org = {PH}',
+       (name, brand, ip, last_login, uptime, rep_user, _iso_now(), hw_id, org))
     put_db(conn)
     return jsonify({"success": True})
 
@@ -296,13 +342,25 @@ def register(org):
 @require_device
 def get_status(org, hw_id):
     conn = get_db()
-    row = q1(conn, f'SELECT status, token, command FROM devices WHERE hw_id = {PH} AND org = {PH}',
-             (hw_id, org))
+    row = q1(conn, f'SELECT status, token, command, last_seen FROM devices '
+                   f'WHERE hw_id = {PH} AND org = {PH}', (hw_id, org))
     command = ""
     if row and row["command"]:
         command = row["command"]
         ex(conn, f'UPDATE devices SET command = {PH} WHERE hw_id = {PH} AND org = {PH}',
            ('', hw_id, org))
+    # Heartbeat (throttled) + optional metadata refresh sent as query params.
+    if row and _age_seconds(rget(row, "last_seen")) >= HEARTBEAT_THROTTLE:
+        sets = ["last_seen = " + PH]
+        vals = [_iso_now()]
+        for col, arg in (("brand", "brand"), ("ip", "ip"), ("last_login", "last_login"),
+                         ("uptime", "uptime"), ("rep_user", "user")):
+            v = request.args.get(arg)
+            if v is not None and v != "":
+                sets.append(f"{col} = {PH}")
+                vals.append(v)
+        vals += [hw_id, org]
+        ex(conn, f'UPDATE devices SET {", ".join(sets)} WHERE hw_id = {PH} AND org = {PH}', vals)
     cred_version = _current_version(conn, org)
     info = _trial_info(conn, org, hw_id)
     put_db(conn)
@@ -320,10 +378,42 @@ def get_status(org, hw_id):
 @require_admin
 def get_all_status(org):
     conn = get_db()
-    rows = qall(conn, f'SELECT hw_id, name, status, token FROM devices WHERE org = {PH}', (org,))
+    rows = qall(conn, f'SELECT hw_id, name, status, token, brand, ip, last_login, '
+                      f'uptime, rep_user, grp, user_override, last_seen '
+                      f'FROM devices WHERE org = {PH}', (org,))
     put_db(conn)
-    return jsonify({r["hw_id"]: {"name": r["name"], "status": r["status"],
-                                 "token": r["token"]} for r in rows})
+    out = {}
+    for r in rows:
+        out[r["hw_id"]] = {
+            "name": r["name"], "status": r["status"], "token": r["token"],
+            "brand": rget(r, "brand"),
+            "ip": rget(r, "ip"),
+            "last_login": rget(r, "last_login"),
+            "uptime": rget(r, "uptime"),
+            "user": (rget(r, "user_override") or rget(r, "rep_user")),
+            "group": rget(r, "grp"),
+            "online": _age_seconds(rget(r, "last_seen")) < ONLINE_WINDOW,
+        }
+    return jsonify(out)
+
+
+@app.route('/admin/set-meta', methods=['POST'])
+@require_admin
+def set_meta(org):
+    data = request.get_json(silent=True) or {}
+    hw_id = data.get("hw_id")
+    if not hw_id:
+        return jsonify({"error": "hw_id required"}), 400
+    group = (data.get("group") or "").strip()
+    user = (data.get("user") or "").strip()
+    conn = get_db()
+    affected = ex(conn, f'UPDATE devices SET grp = {PH}, user_override = {PH} '
+                        f'WHERE hw_id = {PH} AND org = {PH}',
+                  (group, user, hw_id, org))
+    put_db(conn)
+    if affected == 0:
+        return jsonify({"error": "device not found"}), 404
+    return jsonify({"success": True})
 
 
 @app.route('/lock/<hw_id>', methods=['POST'])
